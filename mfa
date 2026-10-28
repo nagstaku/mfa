@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# mfa — TOTP codes from age-encrypted seeds.
+#
+#   mfa                        list entry names
+#   mfa <name>                 print the current code (copied to clipboard on a tty)
+#   mfa --add <name>           store a seed: prompts (hidden), or reads stdin.
+#                              Accepts a base32 secret or an otpauth:// URI.
+#   mfa --rm <name>            delete an entry
+#   mfa --rekey                re-encrypt every entry to the current recipients
+#   mfa --completion zsh|bash  print tab-completion setup for your shell rc
+#
+# Seeds live in $MFA_CONFIG (default ~/.oath/config) as JSON:
+#   {"entries":[{"name":"github","value":"<base64 age ciphertext>"}]}
+# Values are encrypted to the SSH public keys in ~/.oath/recipients (falls back
+# to $MFA_IDENTITY.pub) and decrypted with $MFA_IDENTITY (default
+# ~/.ssh/id_ed25519, else ~/.ssh/id_rsa). List one public key per machine in
+# ~/.oath/recipients and run `mfa --rekey` to share a config between machines.
+# Seeds are only ever passed via pipes, never argv.
+set -euo pipefail
+
+CONFIG=${MFA_CONFIG:-$HOME/.oath/config}
+if [[ -z ${MFA_IDENTITY:-} ]]; then
+  for MFA_IDENTITY in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+    [[ -f $MFA_IDENTITY ]] && break
+  done
+fi
+IDENTITY=$MFA_IDENTITY
+RECIPIENTS=${MFA_RECIPIENTS:-$HOME/.oath/recipients}
+[[ -f $RECIPIENTS ]] || RECIPIENTS="$IDENTITY.pub"
+
+die() { echo "mfa: $*" >&2; exit 1; }
+
+need() {
+  local t
+  for t in "$@"; do command -v "$t" >/dev/null || die "missing dependency: $t"; done
+}
+
+names() { [[ -f $CONFIG ]] && jq -r '.entries[].name' "$CONFIG" || true; }
+
+has() { [[ -f $CONFIG ]] && jq -e --arg n "$1" 'any(.entries[]; .name == $n)' "$CONFIG" >/dev/null; }
+
+# Rewrite the config through a jq filter, atomically and private.
+save() {
+  local tmp
+  tmp=$(mktemp "$CONFIG.XXXXXX")
+  chmod 600 "$tmp"
+  jq "$@" "$CONFIG" >"$tmp" && mv "$tmp" "$CONFIG" || { rm -f "$tmp"; die "failed to write $CONFIG"; }
+}
+
+init_config() {
+  [[ -f $CONFIG ]] && return
+  mkdir -p "$(dirname "$CONFIG")" && chmod 700 "$(dirname "$CONFIG")"
+  (umask 077 && echo '{"entries":[]}' >"$CONFIG")
+}
+
+copy_to_clipboard() {
+  if command -v pbcopy >/dev/null; then pbcopy
+  elif [[ -n ${WAYLAND_DISPLAY:-} ]] && command -v wl-copy >/dev/null; then wl-copy
+  elif [[ -n ${DISPLAY:-} ]] && command -v xclip >/dev/null; then xclip -selection clipboard
+  else return 1
+  fi
+}
+
+cmd_code() {
+  local name=$1 code
+  need age jq oathtool
+  has "$name" || die "no entry '$name' (run \`mfa\` to list)"
+  code=$(jq -r --arg n "$name" '.entries[] | select(.name == $n) | .value' "$CONFIG" |
+    base64 -d | age -d -i "$IDENTITY" | oathtool --totp -b -) || die "could not decrypt '$name' with $IDENTITY"
+  echo "$code"
+  if [[ -t 1 ]] && printf '%s' "$code" | copy_to_clipboard 2>/dev/null; then
+    echo "(copied; valid $((30 - $(date +%s) % 30))s)" >&2
+  fi
+}
+
+cmd_add() {
+  local name=$1 seed enc
+  need age jq oathtool
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "name may only contain letters, digits, . _ -"
+  [[ $name == -* ]] && die "name may not start with '-'"
+  init_config
+  has "$name" && die "'$name' already exists (mfa --rm $name first)"
+
+  if [[ -t 0 ]]; then
+    read -rsp "Seed for $name (base32 or otpauth:// URI): " seed
+    echo >&2
+  else
+    IFS= read -r seed || true
+  fi
+  # Pull the secret out of an otpauth:// URI, then normalise base32.
+  [[ $seed == otpauth://* ]] && seed=$(sed -E 's/.*[?&]secret=([^&]*).*/\1/' <<<"$seed")
+  seed=$(tr -d ' =-' <<<"$seed" | tr '[:lower:]' '[:upper:]')
+  [[ -n $seed ]] || die "empty seed"
+  printf '%s' "$seed" | oathtool --totp -b - >/dev/null 2>&1 || die "that doesn't look like a valid base32 TOTP seed"
+
+  enc=$(printf '%s' "$seed" | age -R "$RECIPIENTS" | base64 | tr -d '\n')
+  save --arg n "$name" --arg v "$enc" '.entries += [{name: $n, value: $v}]'
+  echo "added '$name' (current code: $(printf '%s' "$seed" | oathtool --totp -b -))" >&2
+}
+
+cmd_rm() {
+  local name=$1
+  need jq
+  has "$name" || die "no entry '$name'"
+  save --arg n "$name" '.entries |= map(select(.name != $n))'
+  echo "removed '$name'" >&2
+}
+
+cmd_rekey() {
+  local name enc n=0
+  need age jq
+  [[ -f $CONFIG ]] || die "no config at $CONFIG"
+  while IFS= read -r name; do
+    enc=$(jq -r --arg n "$name" '.entries[] | select(.name == $n) | .value' "$CONFIG" |
+      base64 -d | age -d -i "$IDENTITY" | age -R "$RECIPIENTS" | base64 | tr -d '\n') ||
+      die "could not re-encrypt '$name' (nothing changed)"
+    save --arg n "$name" --arg v "$enc" '.entries |= map(if .name == $n then .value = $v else . end)'
+    n=$((n + 1))
+  done < <(names)
+  echo "re-encrypted $n entries to $(grep -c . "$RECIPIENTS") recipient(s) in $RECIPIENTS" >&2
+}
+
+cmd_completion() {
+  case ${1:-} in
+    zsh)
+      cat <<'EOF'
+_mfa() {
+  if (( CURRENT == 2 )); then
+    if [[ $PREFIX == -* ]]; then compadd -- --add --rm --rekey --completion
+    else compadd -- ${(f)"$(mfa 2>/dev/null)"}; fi
+  elif (( CURRENT == 3 )) && [[ $words[2] == --rm ]]; then
+    compadd -- ${(f)"$(mfa 2>/dev/null)"}
+  elif (( CURRENT == 3 )) && [[ $words[2] == --completion ]]; then
+    compadd -- zsh bash
+  fi
+}
+compdef _mfa mfa
+EOF
+      ;;
+    bash)
+      cat <<'EOF'
+_mfa() {
+  local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+  if (( COMP_CWORD == 1 )); then
+    if [[ $cur == -* ]]; then COMPREPLY=($(compgen -W "--add --rm --rekey --completion" -- "$cur"))
+    else COMPREPLY=($(compgen -W "$(mfa 2>/dev/null)" -- "$cur")); fi
+  elif (( COMP_CWORD == 2 )) && [[ $prev == --rm ]]; then
+    COMPREPLY=($(compgen -W "$(mfa 2>/dev/null)" -- "$cur"))
+  elif (( COMP_CWORD == 2 )) && [[ $prev == --completion ]]; then
+    COMPREPLY=($(compgen -W "zsh bash" -- "$cur"))
+  fi
+}
+complete -F _mfa mfa
+EOF
+      ;;
+    *) die "usage: mfa --completion zsh|bash" ;;
+  esac
+}
+
+case ${1:-} in
+  "") need jq; names ;;
+  --add) [[ -n ${2:-} ]] || die "usage: mfa --add <name>"; cmd_add "$2" ;;
+  --rm) [[ -n ${2:-} ]] || die "usage: mfa --rm <name>"; cmd_rm "$2" ;;
+  --rekey) cmd_rekey ;;
+  --completion) cmd_completion "${2:-}" ;;
+  -h | --help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -*) die "unknown option $1 (see mfa --help)" ;;
+  *) cmd_code "$1" ;;
+esac
